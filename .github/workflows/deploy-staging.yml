@@ -1,0 +1,325 @@
+name: Deploy staging to us-east-1 and ap-northeast-2
+
+on:
+  push:
+    branches:
+      - staging
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.9
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8
+
+      - name: Run flake8
+        run: |
+          flake8 . --count --show-source --statistics
+          exit_code=$?
+          if [ $exit_code -ne 0 ]; then
+              echo "::error::Linting failed with exit code $exit_code"
+              exit $exit_code
+          fi
+
+  package:
+    needs: lint
+    runs-on: ubuntu-latest
+    outputs:
+      lambdas: ${{ steps.find-lambdas.outputs.lambdas }}
+      non_alias: ${{ steps.read-non-alias.outputs.non_alias }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Find Lambda functions
+        id: find-lambdas
+        run: |
+          LAMBDAS=$(find src -maxdepth 1 -mindepth 1 -type d -exec basename {} \; | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "lambdas=$LAMBDAS" >> $GITHUB_OUTPUT
+          echo "Found Lambda functions: $LAMBDAS"
+      
+      - name: Create Lambda zip files
+        run: |
+          mkdir -p dist
+          find src -maxdepth 1 -mindepth 1 -type d | xargs -I{} bash -c '
+            LAMBDA_NAME=$(basename "$1")
+            echo "Packaging $LAMBDA_NAME..."
+            (
+              cd "$1"
+              find . -type f -exec touch -t 200001010000 {} \;
+              find . -type f | sort | zip -r -X -q ../../dist/$LAMBDA_NAME.zip -@
+            )
+          ' _ {}
+          
+      - name: Upload Lambda packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-packages
+          path: dist/*.zip
+          retention-days: 1
+          
+      - name: Read non-alias list
+        id: read-non-alias
+        run: |
+          if [ -f non-alias.txt ]; then
+            NON_ALIAS=$(cat non-alias.txt | tr -d '\r' | sed 's/^[ \t]*//;s/[ \t]*$//' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          else
+            NON_ALIAS="[]"
+          fi
+          echo "non_alias=$NON_ALIAS" >> $GITHUB_OUTPUT
+
+  prepare-env:
+    needs: package
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        lambda: ${{ fromJson(needs.package.outputs.lambdas) }}
+        region: [us-east-1, ap-northeast-2]
+      fail-fast: false
+      max-parallel: 10
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ matrix.region }}
+
+      - name: Fetch environment variables
+        run: |
+          LAMBDA_NAME="${{ matrix.lambda }}"
+          PARAMETERS=$(aws ssm get-parameters-by-path \
+            --path "/LAMBDA/$LAMBDA_NAME/" \
+            --recursive \
+            --with-decryption \
+            --query "Parameters[*]" \
+            --output json)
+
+          if [ "$(echo $PARAMETERS | jq 'length')" -gt "0" ]; then
+            echo '{"Variables":{}}' > "$LAMBDA_NAME-env-${{ matrix.region }}.json"
+            echo "$PARAMETERS" | jq -c '.[]' | while read PARAMETER; do
+              PARAM_NAME=$(echo $PARAMETER | jq -r '.Name')
+              PARAM_VALUE=$(echo $PARAMETER | jq -r '.Value')
+              ENV_KEY=$(echo $PARAM_NAME | awk -F'/' '{print $5}')
+              jq --arg key "$ENV_KEY" --arg value "$PARAM_VALUE" \
+                '.Variables[$key] = $value' "$LAMBDA_NAME-env-${{ matrix.region }}.json" > tmp.json && mv tmp.json "$LAMBDA_NAME-env-${{ matrix.region }}.json"
+            done
+          else
+            echo '{"Variables":{}}' > "$LAMBDA_NAME-env-${{ matrix.region }}.json"
+          fi
+
+      - name: Upload environment variables
+        uses: actions/upload-artifact@v4
+        with:
+          name: env-${{ matrix.region }}-${{ matrix.lambda }}
+          path: "${{ matrix.lambda }}-env-${{ matrix.region }}.json"
+          retention-days: 1
+
+  deploy:
+    needs: [package, prepare-env]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        lambda: ${{ fromJson(needs.package.outputs.lambdas) }}
+        region: [us-east-1, ap-northeast-2]
+      fail-fast: false
+      max-parallel: 10
+    
+    steps:
+      - name: Install tools
+        run: sudo apt-get update -q -y && sudo apt-get install -q -y jq xxd
+      
+      - name: Download Lambda packages
+        uses: actions/download-artifact@v4
+        with:
+          name: lambda-packages
+          path: dist
+      
+      - name: Download environment variables
+        uses: actions/download-artifact@v4
+        with:
+          name: env-${{ matrix.region }}-${{ matrix.lambda }}
+          path: .
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ matrix.region }}
+      
+      - name: Check if Lambda function exists
+        id: check-lambda
+        run: |
+          if aws lambda get-function --function-name ${{ matrix.lambda }} --region ${{ matrix.region }} &>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "::warning::Lambda function ${{ matrix.lambda }} does not exist in ${{ matrix.region }}"
+          fi
+      
+      - name: Deploy Lambda Code
+        if: steps.check-lambda.outputs.exists == 'true'
+        run: |
+          echo "Deploying ${{ matrix.lambda }} to ${{ matrix.region }}"
+          
+          # Calculate new code hash
+          NEW_CODE_HASH=$(shasum -a 256 dist/${{ matrix.lambda }}.zip | awk '{print $1}' | xxd -r -p | base64)
+          
+          # Get current code hash
+          CURRENT_CODE_HASH=$(aws lambda get-function \
+            --function-name ${{ matrix.lambda }} \
+            --region ${{ matrix.region }} \
+            --query 'Configuration.CodeSha256' \
+            --output text 2>/dev/null || echo "")
+            
+          # Check if Lambda uses alias mode
+          NON_ALIAS='${{ needs.package.outputs.non_alias }}'
+          if echo "$NON_ALIAS" | jq -e ".[] | select(. == \"${{ matrix.lambda }}\")" > /dev/null; then
+            # Non-alias mode (direct update)
+            echo "${{ matrix.lambda }} : non-alias deployment mode"
+              
+            # Update function code if needed
+            if [ "$CURRENT_CODE_HASH" != "$NEW_CODE_HASH" ]; then
+              echo "Updating function code"
+              aws lambda update-function-code \
+                --function-name ${{ matrix.lambda }} \
+                --region ${{ matrix.region }} \
+                --zip-file fileb://dist/${{ matrix.lambda }}.zip \
+                --no-publish
+                
+              echo "Waiting for code update to complete..."
+              aws lambda wait function-updated \
+                --function-name ${{ matrix.lambda }} \
+                --region ${{ matrix.region }}
+              echo "Code update completed"
+            else
+              echo "No code changes detected."
+            fi
+          else
+            # Alias mode
+            echo "${{ matrix.lambda }} : alias deployment mode"
+            
+            # Check if staging alias exists
+            if ! aws lambda get-alias \
+                --function-name ${{ matrix.lambda }} \
+                --name staging \
+                --region ${{ matrix.region }} &>/dev/null; then
+              echo "Warning: staging alias does not exist for ${{ matrix.lambda }} in ${{ matrix.region }}"
+              echo "Creating staging alias pointing to \$LATEST"
+              aws lambda create-alias \
+                --function-name ${{ matrix.lambda }} \
+                --name staging \
+                --function-version \$LATEST \
+                --region ${{ matrix.region }}
+            fi
+            
+            # Update function code if needed
+            if [ "$CURRENT_CODE_HASH" != "$NEW_CODE_HASH" ]; then
+              echo "Updating function code"
+              aws lambda update-function-code \
+                --function-name ${{ matrix.lambda }} \
+                --region ${{ matrix.region }} \
+                --zip-file fileb://dist/${{ matrix.lambda }}.zip \
+                --no-publish
+                
+              echo "Waiting for code update to complete..."
+              aws lambda wait function-updated \
+                --function-name ${{ matrix.lambda }} \
+                --region ${{ matrix.region }}
+              echo "Code update completed"
+              
+              # Publish new version
+              VERSION_ID="${{ github.sha }}-$(date +%s)"
+              echo "Publishing new version"
+              LAMBDA_VERSION=$(aws lambda publish-version \
+                --function-name ${{ matrix.lambda }} \
+                --region ${{ matrix.region }} \
+                --description "${VERSION_ID}" \
+                --query Version \
+                --output text)
+              echo "Published version: $LAMBDA_VERSION"
+              
+              # Update alias to point to the new version
+              echo "Updating staging alias to version $LAMBDA_VERSION"
+              aws lambda update-alias \
+                --function-name ${{ matrix.lambda }} \
+                --name staging \
+                --region ${{ matrix.region }} \
+                --function-version $LAMBDA_VERSION
+              echo "Alias 'staging' updated to version $LAMBDA_VERSION"
+            else
+              echo "No code changes detected."
+            fi
+          fi
+      
+      - name: Update Environment Variables
+        if: steps.check-lambda.outputs.exists == 'true'
+        run: |
+          # Get current configuration
+          LAMBDA_CONFIG=$(aws lambda get-function-configuration \
+            --function-name ${{ matrix.lambda }} \
+            --region ${{ matrix.region }} 2>/dev/null || echo '{"error": "unable to get config"}')
+            
+          if echo $LAMBDA_CONFIG | jq -e '.error' &>/dev/null; then
+            echo "ERROR: Could not retrieve Lambda configuration"
+            exit 1
+          fi
+          
+          # Get current environment variables
+          CURRENT_ENV=$(echo $LAMBDA_CONFIG | jq -c '.Environment.Variables // {}')
+          
+          # Load new environment variables
+          ENV_FILE="${{ matrix.lambda }}-env-${{ matrix.region }}.json"
+          if [[ -f "$ENV_FILE" ]]; then
+            NEW_ENV=$(jq -c '.Variables // {}' "$ENV_FILE")
+            
+            # Compare environment variables
+            if [ "$CURRENT_ENV" != "$NEW_ENV" ]; then
+              echo "Updating environment variables"
+              aws lambda update-function-configuration \
+                --function-name ${{ matrix.lambda }} \
+                --region ${{ matrix.region }} \
+                --environment "file://$ENV_FILE"
+                
+              echo "Waiting for configuration update to complete..."
+              aws lambda wait function-updated \
+                --function-name ${{ matrix.lambda }} \
+                --region ${{ matrix.region }}
+              echo "Configuration update completed"
+            else
+              echo "No environment variable changes detected."
+            fi
+          else
+            echo "No environment file found. Skipping environment update."
+          fi
+
+  deployment-summary:
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Summarize deployment results
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.deploy.result }}" == "success" ]; then
+            echo "✅ All Lambda functions deployed successfully to all regions" >> $GITHUB_STEP_SUMMARY
+            echo "::notice::Deployment completed successfully"
+          else
+            echo "❌ Some Lambda functions failed to deploy" >> $GITHUB_STEP_SUMMARY
+            echo "::error::Deployment completed with errors"
+            exit 1
+          fi

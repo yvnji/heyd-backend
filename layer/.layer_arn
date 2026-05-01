@@ -1,0 +1,4 @@
+ap-northeast-2/inapp_payment_layer='arn:aws:lambda:ap-northeast-2:881039470611:layer:inapp_payment_layer:5'
+ap-northeast-2/idolmaster-layer='arn:aws:lambda:ap-northeast-2:881039470611:layer:idolmaster-layer:6'
+us-east-1/inapp_payment_layer='arn:aws:lambda:us-east-1:881039470611:layer:inapp_payment_layer:3'
+us-east-1/idolmaster-layer='arn:aws:lambda:us-east-1:881039470611:layer:idolmaster-layer:4'

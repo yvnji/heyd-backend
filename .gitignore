@@ -1,0 +1,15 @@
+*__pycache__*
+.env
+.env.*
+__pycache__/
+*.pyc
+.serverless/
+.aws/
+local-python*
+.vscode
+.python-version
+poetry.lock
+pyproject.toml
+.DS_Store
+*MACOSX*
+*test.py

@@ -1,0 +1,26 @@
+[flake8]
+max-line-length = 120
+exclude =
+    .DS_Store,
+    .env,
+    .git,
+    .gitignore,
+    .python-version,
+    .vscode,
+    *__pycache__*,
+    *MACOSX*,
+    layer/*,
+    local-python*,
+    poetry.lock,
+    pyproject.toml,
+    venv/
+    .venv/
+ignore =
+    E501,
+    E731,
+    W503,
+    E226
+
+# E501: Line too long
+# E731: Do not assign a lambda expression
+# W503: Line break before binary operator
