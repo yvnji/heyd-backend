@@ -16,7 +16,7 @@ across Korea and the US.
 
 ## 🏗️ Architecture Overview
 
-![Hey.D Architecture](./architecture.png)
+![Hey.D Architecture](./heyd_backend_architecture.svg)
 
 The backend is fully serverless on AWS, structured around 
 three independent Lambda tracks:
